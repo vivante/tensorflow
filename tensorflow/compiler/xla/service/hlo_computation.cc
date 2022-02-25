@@ -30,6 +30,7 @@ limitations under the License.
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/types/span.h"
 #include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/map_util.h"
 #include "tensorflow/compiler/xla/service/dfs_hlo_visitor_with_default.h"
@@ -406,6 +407,20 @@ void ComputeComputationPostOrder(HloComputation* computation,
   }
 }
 
+absl::optional<int64_t> GetChannelId(const HloInstruction& inst) {
+  switch (inst.opcode()) {
+    case HloOpcode::kSend:
+    case HloOpcode::kRecvDone:
+    case HloOpcode::kAllReduce:
+    case HloOpcode::kAllGather:
+    case HloOpcode::kAllToAll:
+    case HloOpcode::kReduceScatter:
+      return inst.channel_id();
+    default:
+      return absl::nullopt;
+  }
+}
+
 }  // namespace
 
 void HloComputation::ComputeInstructionPostOrder(
@@ -413,81 +428,51 @@ void HloComputation::ComputeInstructionPostOrder(
     std::vector<HloInstruction*>* post_order, HloInstruction* root,
     absl::flat_hash_map<HloInstruction*, VisitState>* visited) const {
   std::vector<HloInstruction*> dfs_stack;
-  dfs_stack.push_back(root);
-  while (!dfs_stack.empty()) {
-    const auto current = dfs_stack.back();
-    CHECK_EQ(current->parent(), this)
-        << "Instruction " << current->name()
-        << " is not in the current computation (" << name() << ").";
-    auto it = visited->find(current);
-    if (it != visited->end()) {
-      if (it->second == kVisited) {
-        // Already visited.
-        dfs_stack.pop_back();
-        continue;
+
+  // When adding an instruction to the DFS stack, we need to also add its
+  // associated channel dependencies.
+  auto add_dfs_stack = [&](HloInstruction& inst) {
+    absl::optional<int64_t> channel_id = GetChannelId(inst);
+    if (channel_id) {
+      auto it = channel_dependency_group.find(*channel_id);
+      if (it != channel_dependency_group.end()) {
+        for (HloInstruction* dep_inst : it->second) {
+          dfs_stack.push_back(dep_inst);
+        }
+        return;
       }
-      // Visit this node.
-      CHECK_EQ(kVisiting, it->second);
+    }
+    dfs_stack.push_back(&inst);
+  };
+
+  add_dfs_stack(*root);
+
+  while (!dfs_stack.empty()) {
+    HloInstruction& current = *dfs_stack.back();
+    CHECK_EQ(current.parent(), this)
+        << "Instruction " << current.name()
+        << " is not in the current computation (" << name() << ").";
+
+    auto result = visited->insert({&current, kVisiting});
+    if (!result.second) {  // We've already seen this instruction.
       dfs_stack.pop_back();
-      post_order->push_back(current);
-      it->second = kVisited;
+      if (result.first->second != kVisited) {
+        post_order->push_back(&current);
+        result.first->second = kVisited;
+      }
       continue;
     }
 
-    visited->insert({current, kVisiting});
+    // Add the operands to the stack in reverse order so the first operand is
+    // processed first. This will produce a more natural ordering and a nicer
+    // result for things like HLO stringification.
+    const HloInstruction::InstructionVector& operands = current.operands();
+    for (auto it = operands.rbegin(); it != operands.rend(); ++it) {
+      add_dfs_stack(**it);
+    }
 
-    const auto get_channel_id =
-        [](HloInstruction* inst) -> absl::optional<int64_t> {
-      switch (inst->opcode()) {
-        case HloOpcode::kRecvDone:
-        case HloOpcode::kAllReduce:
-        case HloOpcode::kAllGather:
-        case HloOpcode::kAllToAll:
-        case HloOpcode::kReduceScatter:
-          return inst->channel_id();
-        default:
-          return absl::nullopt;
-      }
-    };
-
-    // When adding a predecessor to the dfs_stack, we need to also add its
-    // associated channel dependencies.
-    const auto add_dfs_stack = [&](HloInstruction* inst) {
-      auto channel_id = get_channel_id(inst);
-      if (channel_id && channel_dependency_group.count(*channel_id)) {
-        auto it = channel_dependency_group.find(*channel_id);
-        for (HloInstruction* cinst : it->second) {
-          dfs_stack.emplace_back(cinst);
-        }
-      } else {
-        dfs_stack.emplace_back(inst);
-      }
-    };
-
-    const auto add_predecessors = [&](HloInstruction* inst) {
-      // Add the operands to the stack in reverse order so the first operand is
-      // processed first. This will produce a more natural ordering and a nicer
-      // result for things like HLO stringification.
-      const auto& operands = inst->operands();
-      for (int64_t i = operands.size() - 1; i >= 0; --i) {
-        add_dfs_stack(operands[i]);
-      }
-
-      for (HloInstruction* op : inst->control_predecessors()) {
-        add_dfs_stack(op);
-      }
-    };
-
-    // If the current instruction is a channel instruction, add the dependencies
-    // from all associated instructions of the channel.
-    auto channel_id = get_channel_id(current);
-    if (channel_id && channel_dependency_group.count(*channel_id)) {
-      auto it = channel_dependency_group.find(*channel_id);
-      for (HloInstruction* cinst : it->second) {
-        add_predecessors(cinst);
-      }
-    } else {
-      add_predecessors(current);
+    for (HloInstruction* op : current.control_predecessors()) {
+      add_dfs_stack(*op);
     }
   }
 }
@@ -500,24 +485,11 @@ HloComputation::ComputeChannelDependencies() const {
        parent()->config().use_spmd_partitioning())) {
     return channel_dependency_group;
   }
+
   for (const auto& instruction : instructions_) {
-    switch (instruction->opcode()) {
-      case HloOpcode::kSend:
-      case HloOpcode::kRecvDone:
-      case HloOpcode::kAllReduce:
-      case HloOpcode::kAllGather:
-      case HloOpcode::kAllToAll:
-      case HloOpcode::kReduceScatter: {
-        auto channel_id = instruction->channel_id();
-        if (channel_id) {
-          channel_dependency_group[channel_id.value()].push_back(
-              instruction.get());
-        }
-        break;
-      }
-      default:
-        break;
-    }
+    absl::optional<int64_t> channel_id = GetChannelId(*instruction);
+    if (channel_id)
+      channel_dependency_group[*channel_id].push_back(instruction.get());
   }
   return channel_dependency_group;
 }
