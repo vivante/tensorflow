@@ -22,7 +22,10 @@ filegroup(
 
 # TODO(b/)220688154): Enable MLIR test cases.
 #glob_lit_tests(
-#    data = [":test_utilities"],
+#    data = [
+#        ":test_utilities",
+#        "//tensorflow/compiler/mlir/quantization/tensorflow:quantized_function_library_mlir",
+#    ],
 #    driver = "@llvm-project//mlir:run_lit.sh",
 #    test_file_exts = ["mlir"],
 #)

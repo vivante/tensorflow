@@ -476,3 +476,12 @@ tensorflow::flags::Flags::GetExportedFlag
 [//tensorflow/core/config:flags] # flags_api
 tensorflow::config::Flag::value
 tensorflow::config::Flag::reset
+
+[//tensorflow/compiler/mlir/quantization/tensorflow/python:quantize_model_cc] # quantization
+tensorflow::quantization::QuantizeQATModel
+tensorflow::quantization::QuantizePTQModelPreCalibration
+tensorflow::quantization::QuantizePTQModelPostCalibration
+tensorflow::quantization::ClearCollectedInformationFromCalibrator
+tensorflow::quantization::ClearDataFromCalibrator
+tensorflow::quantization::GetMinFromCalibrator
+tensorflow::quantization::GetMaxFromCalibrator
